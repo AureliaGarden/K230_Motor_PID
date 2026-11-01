@@ -1,0 +1,5 @@
+# Keil build output and user-specific interface settings
+MDK-ARM/study/
+MDK-ARM/*.lst
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
