@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 
 /* USER CODE END Includes */
 
@@ -47,10 +48,13 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 uint8_t rx_byte;
-uint8_t rx_buffer[64];
+volatile uint8_t rx_buffer[64];
 volatile uint8_t rx_write = 0;
 volatile uint8_t rx_read = 0;
 volatile uint32_t rx_overflow = 0;
+uint16_t ball_x = 0;
+uint8_t ball_valid = 0;
+uint32_t invalid_frames = 0;
 
 /* USER CODE END PV */
 
@@ -66,6 +70,142 @@ static void MX_TIM3_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* Collect five-byte K230 frames and print valid positions over USART2. */
+static void ProcessK230Byte(uint8_t byte)
+{
+  static uint8_t frame[5];
+  static uint8_t count = 0;
+  uint8_t checksum;
+  uint16_t x;
+  uint8_t i;
+  char text[32];
+  int length;
+
+  if (count == 0 && byte != 0xAA)
+  {
+    return;
+  }
+
+  frame[count++] = byte;
+  if (count < 5)
+  {
+    return;
+  }
+
+  checksum = (uint8_t)(frame[1] + frame[2] + frame[3]);
+  x = ((uint16_t)frame[2] << 8) | frame[1];
+
+  if (checksum == frame[4] && (frame[3] & 0xFC) == 0 &&
+      (((frame[3] & 0x01) != 0 && x <= 640) ||
+       (frame[3] == 0 && x == 0xFFFF)))
+  {
+    count = 0;
+    ball_valid = (frame[3] & 0x01) != 0;
+    if (ball_valid)
+    {
+      ball_x = x;
+      length = snprintf(text, sizeof(text), "x=%u px\r\n", (unsigned int)x);
+    }
+    else
+    {
+      length = snprintf(text, sizeof(text), "no target\r\n");
+    }
+
+    if (length > 0 && length < (int)sizeof(text))
+    {
+      HAL_UART_Transmit(&huart2, (uint8_t *)text, (uint16_t)length, 10);
+    }
+    return;
+  }
+
+  invalid_frames++;
+  /* Keep a possible next frame header within the rejected candidate. */
+  for (i = 1; i < 5; i++)
+  {
+    if (frame[i] == 0xAA)
+    {
+      break;
+    }
+  }
+  if (i < 5)
+  {
+    count = 5 - i;
+    for (uint8_t j = 0; j < count; j++)
+    {
+      frame[j] = frame[i + j];
+    }
+  }
+  else
+  {
+    count = 0;
+  }
+}
+
+/* Keep the existing two-direction motor test without blocking the loop. */
+static void MotorTestTask(void)
+{
+  static uint8_t state = 0;
+  static uint32_t start_tick = 0;
+  uint32_t now = HAL_GetTick();
+
+  switch (state)
+  {
+    case 0:
+      HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+      start_tick = now;
+      state = 1;
+      break;
+    case 1:
+      if ((uint32_t)(now - start_tick) >= 20)
+      {
+        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+        start_tick = now;
+        state = 2;
+      }
+      break;
+    case 2:
+      if ((uint32_t)(now - start_tick) >= 2000)
+      {
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+        start_tick = now;
+        state = 3;
+      }
+      break;
+    case 3:
+      if ((uint32_t)(now - start_tick) >= 20)
+      {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+        start_tick = now;
+        state = 4;
+      }
+      break;
+    case 4:
+      if ((uint32_t)(now - start_tick) >= 20)
+      {
+        HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+        start_tick = now;
+        state = 5;
+      }
+      break;
+    case 5:
+      if ((uint32_t)(now - start_tick) >= 2000)
+      {
+        HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+        start_tick = now;
+        state = 6;
+      }
+      break;
+    case 6:
+      if ((uint32_t)(now - start_tick) >= 20)
+      {
+        state = 0;
+      }
+      break;
+    default:
+      state = 0;
+      break;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -113,28 +253,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (rx_read != rx_write)
+    while (rx_read != rx_write)
     {
       uint8_t data = rx_buffer[rx_read];
       rx_read = (rx_read + 1) % 64;
-      HAL_UART_Transmit(&huart2, &data, 1, 10);
+      ProcessK230Byte(data);
     }
-
-    /* Direction 1: wait for DIR to settle, then send STEP pulses. */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-    HAL_Delay(20);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    HAL_Delay(2000);
-    HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
-    HAL_Delay(20);
-
-    /* Direction 2: stop STEP before changing DIR. */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
-    HAL_Delay(20);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    HAL_Delay(2000);
-    HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
-    HAL_Delay(20);
+    MotorTestTask();
   }
   /* USER CODE END 3 */
 }
@@ -194,9 +319,9 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 79;
+  htim3.Init.Prescaler = 29;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 999;
+  htim3.Init.Period = 249;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
@@ -210,7 +335,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 500;
+  sConfigOC.Pulse = 125;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
